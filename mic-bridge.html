@@ -7,7 +7,8 @@
 body { margin:0; padding:10px; font:13px sans-serif; background:#1a1a2e; color:#ddd; min-width:280px; }
 .status { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
 .dot { width:10px; height:10px; border-radius:50%; }
-.dot.ready { background:#4CAF50; }
+.dot.off { background:#666; }
+.dot.on { background:#4CAF50; }
 .dot.recording { background:#f44336; animation:pulse 1s infinite; }
 .dot.error { background:#ff9800; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
@@ -18,7 +19,7 @@ body { margin:0; padding:10px; font:13px sans-serif; background:#1a1a2e; color:#
 </head>
 <body>
 <div class="status">
-  <div class="dot" id="statusDot"></div>
+  <div class="dot off" id="statusDot"></div>
   <span id="statusText">준비 중...</span>
 </div>
 <div id="levelBar"><div id="levelFill"></div></div>
@@ -26,10 +27,9 @@ body { margin:0; padding:10px; font:13px sans-serif; background:#1a1a2e; color:#
 
 <script>
 const opener = window.opener;
-let audioCtx = null;
-let mediaStream = null;
+let keepStream = null;
+let recAudioCtx = null;
 let workletNode = null;
-let workletRegistered = false;
 let analyser = null;
 let levelRAF = null;
 let isRecording = false;
@@ -38,7 +38,6 @@ const CHUNK_SIZE = 8192;
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const levelFill = document.getElementById('levelFill');
-const info = document.getElementById('info');
 
 function setStatus(state, text) {
   statusDot.className = 'dot ' + state;
@@ -51,149 +50,119 @@ function send(data, transfer) {
   }
 }
 
-// ===== 메시지 수신 =====
 window.addEventListener('message', async (e) => {
   const msg = e.data;
   if (!msg || !msg.cmd) return;
   try {
     switch(msg.cmd) {
-      case 'enumerate': await doEnumerate(); break;
+      case 'enumerate': await doEnumerate(msg.deviceId); break;
       case 'start': await doStart(msg); break;
       case 'stop': doStop(); break;
-      case 'pause': isRecording = false; setStatus('ready', '일시정지'); break;
+      case 'pause': isRecording = false; setStatus('on', '⏸ 일시정지'); break;
       case 'resume': isRecording = true; setStatus('recording', '🔴 녹음 중'); break;
     }
   } catch(err) {
+    console.error('Bridge error:', err);
     setStatus('error', '오류: ' + err.message);
     send({type:'error', message: err.message});
   }
 });
 
-// ===== 장치 열거 =====
-async function doEnumerate() {
-  setStatus('ready', '마이크 권한 요청 중...');
+// ===== 장치 열거 + 스트림 유지 =====
+async function doEnumerate(deviceId) {
+  setStatus('off', '마이크 권한 요청 중...');
+  if (keepStream) { keepStream.getTracks().forEach(t => t.stop()); keepStream = null; }
   try {
-    const tempStream = await navigator.mediaDevices.getUserMedia({audio:true});
-    tempStream.getTracks().forEach(t => t.stop());
+    const c = { audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false }};
+    if (deviceId && deviceId !== 'default' && deviceId !== '') c.audio.deviceId = {exact:deviceId};
+    keepStream = await navigator.mediaDevices.getUserMedia(c);
   } catch(e) {
     setStatus('error', '마이크 권한 거부됨');
-    send({type:'devices', devices: []});
+    send({type:'devices', devices:[]});
     return;
   }
   const devices = await navigator.mediaDevices.enumerateDevices();
   const audioInputs = devices.filter(d => d.kind === 'audioinput').map(d => ({
     deviceId: d.deviceId, label: d.label, kind: d.kind
   }));
-  setStatus('ready', '✅ 마이크 연결됨 (' + audioInputs.length + '개)');
+  setStatus('on', '🎤 마이크 ON (' + audioInputs.length + '개)');
   send({type:'devices', devices: audioInputs});
 }
 
-// ===== 녹음 시작 =====
+// ===== 녹음 시작 (스트림 재사용) =====
 async function doStart(msg) {
-  doStop(); // 이전 세션 정리
-
-  const constraints = { audio: {
-    echoCancellation: false, noiseSuppression: false, autoGainControl: false
-  }};
-  if (msg.deviceId && msg.deviceId !== 'default' && msg.deviceId !== '') {
-    constraints.audio.deviceId = {exact: msg.deviceId};
+  cleanupRecSession();
+  let stream = keepStream;
+  if (!stream || stream.getAudioTracks().length === 0 || !stream.active) {
+    const c = { audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false }};
+    if (msg.deviceId && msg.deviceId !== 'default') c.audio.deviceId = {exact:msg.deviceId};
+    if (msg.channels >= 2) c.audio.channelCount = 2;
+    stream = await navigator.mediaDevices.getUserMedia(c);
+    keepStream = stream;
   }
-  if (msg.channels >= 2) constraints.audio.channelCount = 2;
-
-  setStatus('ready', '마이크 접근 중...');
-  mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-
-  audioCtx = new AudioContext({sampleRate: msg.sampleRate || 48000});
-  if (audioCtx.state === 'suspended') await audioCtx.resume();
-
-  const source = audioCtx.createMediaStreamSource(mediaStream);
-
-  // 레벨 미터용 분석기
-  analyser = audioCtx.createAnalyser();
+  recAudioCtx = new AudioContext({sampleRate: msg.sampleRate || 48000});
+  if (recAudioCtx.state === 'suspended') await recAudioCtx.resume();
+  const source = recAudioCtx.createMediaStreamSource(stream);
+  analyser = recAudioCtx.createAnalyser();
   analyser.fftSize = 2048;
   source.connect(analyser);
-
-  // PCM 캡처용 AudioWorklet
-  const workletCode = `
-    class RecorderProcessor extends AudioWorkletProcessor {
-      constructor() { super(); this.sz=${CHUNK_SIZE}; this.bL=new Float32Array(this.sz); this.bR=new Float32Array(this.sz); this.p=0; }
-      process(inputs) {
-        const inp=inputs[0]; if(!inp||!inp[0]) return true;
-        for(let i=0;i<inp[0].length;i++){
-          this.bL[this.p]=inp[0][i]; this.bR[this.p]=inp.length>=2?inp[1][i]:inp[0][i]; this.p++;
-          if(this.p>=this.sz){
-            this.port.postMessage({left:new Float32Array(this.bL),right:new Float32Array(this.bR)});
-            this.bL=new Float32Array(this.sz); this.bR=new Float32Array(this.sz); this.p=0;
-          }
-        }
-        return true;
-      }
-    }
-    registerProcessor('rec-proc',RecorderProcessor);
-  `;
-  const blob = new Blob([workletCode], {type:'application/javascript'});
+  const spCh = msg.channels >= 2 ? 2 : 1;
+  const code = `class RP extends AudioWorkletProcessor{constructor(){super();this.sz=${CHUNK_SIZE};this.bL=new Float32Array(this.sz);this.bR=new Float32Array(this.sz);this.p=0;}process(inputs){const inp=inputs[0];if(!inp||!inp[0])return true;for(let i=0;i<inp[0].length;i++){this.bL[this.p]=inp[0][i];this.bR[this.p]=inp.length>=2?inp[1][i]:inp[0][i];this.p++;if(this.p>=this.sz){this.port.postMessage({left:new Float32Array(this.bL),right:new Float32Array(this.bR)});this.bL=new Float32Array(this.sz);this.bR=new Float32Array(this.sz);this.p=0;}}return true;}}registerProcessor('rp',RP);`;
+  const blob = new Blob([code], {type:'application/javascript'});
   const url = URL.createObjectURL(blob);
-  if (!workletRegistered) {
-    try { await audioCtx.audioWorklet.addModule(url); workletRegistered = true; } catch(e) { workletRegistered = true; }
-  }
+  try { await recAudioCtx.audioWorklet.addModule(url); } catch(e) {}
   URL.revokeObjectURL(url);
-
-  workletNode = new AudioWorkletNode(audioCtx, 'rec-proc', {
-    numberOfInputs:1, numberOfOutputs:0, channelCount: msg.channels >= 2 ? 2 : 1
-  });
-  workletNode.port.onmessage = (e) => {
+  workletNode = new AudioWorkletNode(recAudioCtx, 'rp', {numberOfInputs:1, numberOfOutputs:0, channelCount:spCh});
+  workletNode.port.onmessage = (evt) => {
     if (!isRecording) return;
-    send({type:'pcm', left:e.data.left, right:e.data.right}, [e.data.left.buffer, e.data.right.buffer]);
+    send({type:'pcm', left:evt.data.left, right:evt.data.right}, [evt.data.left.buffer, evt.data.right.buffer]);
   };
   source.connect(workletNode);
-
   isRecording = true;
   startLevelMeter();
   setStatus('recording', '🔴 녹음 중');
-  send({type:'started', sampleRate: audioCtx.sampleRate});
+  send({type:'started', sampleRate: recAudioCtx.sampleRate});
 }
 
-// ===== 녹음 중지 =====
-function doStop() {
-  const wasRecording = isRecording;
+function cleanupRecSession() {
   isRecording = false;
   if (levelRAF) { cancelAnimationFrame(levelRAF); levelRAF = null; }
-  if (workletNode) { try { workletNode.disconnect(); } catch(e){} workletNode = null; }
-  if (analyser) { try { analyser.disconnect(); } catch(e){} analyser = null; }
-  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-  if (audioCtx) { audioCtx.close().catch(()=>{}); audioCtx = null; workletRegistered = false; }
+  if (workletNode) { try{workletNode.disconnect();}catch(e){} workletNode = null; }
+  if (analyser) { try{analyser.disconnect();}catch(e){} analyser = null; }
+  if (recAudioCtx) { recAudioCtx.close().catch(()=>{}); recAudioCtx = null; }
   levelFill.style.width = '0%';
-  if (wasRecording) {
-    setStatus('ready', '✅ 녹음 완료');
+}
+
+function doStop() {
+  const was = isRecording;
+  cleanupRecSession();
+  if (was) {
+    setStatus('on', '🎤 마이크 ON');
     send({type:'stopped'});
   }
 }
 
-// ===== 레벨 미터 =====
 function startLevelMeter() {
   if (!analyser) return;
   const buf = new Float32Array(analyser.fftSize);
   function tick() {
-    if (!analyser || !isRecording) return;
+    if (!analyser) return;
     analyser.getFloatTimeDomainData(buf);
-    let sum = 0;
-    for (let i=0; i<buf.length; i++) sum += buf[i]*buf[i];
-    const rms = Math.sqrt(sum/buf.length);
-    const db = rms > 0 ? 20*Math.log10(rms) : -100;
-    const pct = Math.max(0, Math.min(100, (db+60)/60*100));
-    levelFill.style.width = pct + '%';
-    send({type:'level', rms, db, percent:pct});
-    levelRAF = requestAnimationFrame(tick);
+    let sum=0; for(let i=0;i<buf.length;i++) sum+=buf[i]*buf[i];
+    const rms=Math.sqrt(sum/buf.length);
+    const db=rms>0?20*Math.log10(rms):-100;
+    const pct=Math.max(0,Math.min(100,(db+60)/60*100));
+    levelFill.style.width=pct+'%';
+    if(isRecording) send({type:'level',rms,db,percent:pct});
+    levelRAF=requestAnimationFrame(tick);
   }
-  levelRAF = requestAnimationFrame(tick);
+  levelRAF=requestAnimationFrame(tick);
 }
 
-// ===== 초기화 =====
-setStatus('ready', '✅ 준비됨');
+setStatus('on', '✅ 준비됨');
 send({type:'ready'});
-
-// opener 닫히면 자동 종료
-setInterval(() => { if (!opener || opener.closed) window.close(); }, 3000);
+setInterval(()=>{if(!opener||opener.closed){if(keepStream)keepStream.getTracks().forEach(t=>t.stop());window.close();}},3000);
+window.addEventListener('beforeunload',()=>{cleanupRecSession();if(keepStream){keepStream.getTracks().forEach(t=>t.stop());keepStream=null;}});
 </script>
 </body>
 </html>
