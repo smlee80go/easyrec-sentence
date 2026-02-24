@@ -6826,10 +6826,25 @@
       resetListLayout(); // ✅ 변경: updateListLayout() → resetListLayout()
     }
 
-    function runGAS(fn, ...args) {
-      return new Promise((resolve, reject) => {
-        google.script.run.withSuccessHandler(resolve).withFailureHandler(e => reject(new Error(e && e.message ? e.message : String(e))))[fn](...args);
+    const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbyG-lgo-asWBfZcsisLHuTyLI1Uz3lhhZG4Tu5Gh6iG0ahmU5a6en6Yq30YZ5prGwWGCw/exec';
+
+    async function runGAS(fn, ...args) {
+      const body = { action: fn };
+      if (fn === 'login') { body.id = args[0]; body.pw = args[1]; }
+      else if (fn === 'logout') { body.token = args[0]; }
+      else if (fn === 'whoami') { body.token = args[0]; }
+
+      const resp = await fetch(GAS_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify(body),
+        redirect: 'follow'
       });
+      const result = await resp.json();
+      if (result && result.ok === false && result.reason) {
+        throw new Error(result.reason);
+      }
+      return result;
     }
     // Toggle Collapsible Section
     window.toggleSection = function(sectionId) {
